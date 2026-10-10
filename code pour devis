@@ -1,0 +1,472 @@
+# -*- coding: utf-8 -*-
+"""
+scan_universel_spyder.py — Chasse aux Devis Fantômes (Spyder 6)
+=================================================================
+UN SEUL script pour TOUS les formats de boîte mail :
+  - .mbox (Gmail exporté, Thunderbird)
+  - .zip (export Google Takeout : extrait le .mbox dedans tout seul)
+  - .pst (archive Outlook)
+  - un DOSSIER : il y cherche les .mbox et .pst (sous-dossiers inclus)
+  - un mix : un dossier avec les deux formats → tout est analysé
+
+Le format est détecté AUTOMATIQUEMENT selon l'extension du fichier.
+
+PRÉREQUIS :
+  - .mbox / .zip : rien à installer (bibliothèque standard)
+  - .pst : une fois, dans la console Spyder :  !pip install libpff-python
+
+MODE D'EMPLOI :
+  1. Ouvre ce fichier dans Spyder, F5 (▶)
+  2. Glisse-dépose le fichier/dossier dans la console → Entrée
+     — ou colle le chemin dans la variable CHEMIN en haut
+  3. Le rapport s'affiche ; le CSV est créé dans DOSSIER_SORTIE.
+
+Tout se passe EN LOCAL. Aucun email ne quitte l'ordinateur.
+"""
+
+import csv
+import mailbox
+import os
+import re
+import tempfile
+import zipfile
+from datetime import datetime, timedelta
+from email.header import decode_header, make_header
+from email.utils import getaddresses, parsedate_to_datetime
+
+# ===============================================================
+# PARAMÈTRES
+# ===============================================================
+
+# Chemin du .mbox / .zip / .pst / dossier, ou "" pour que le script
+# demande dans la console. Ex. :
+# CHEMIN = r"C:\Users\2006m\Downloads\archive_client.pst"
+CHEMIN = ""
+
+# Nom du fichier CSV produit
+FICHIER_CSV = "devis_extraits.csv"
+
+# Dossier où déposer le CSV final (créé automatiquement s'il n'existe pas)
+DOSSIER_SORTIE = r"C:\Users\2006m\OneDrive\Documents\Travail\Dépot fichier CSV"
+
+# Fenêtre temporelle : nombre de mois d'emails analysés
+FENETRE_MOIS = 18
+
+# Date de début au format "AAAA-MM-JJ" ; "" = utilise FENETRE_MOIS
+DEPUIS = ""
+
+# Nb max de candidats dans le CSV
+TOP = 800
+
+# ---------------------------------------------------------------
+# FILTRES DE BRUIT — à personnaliser par client si besoin
+# ---------------------------------------------------------------
+
+EXPEDITEURS_EXCUS = [
+    "no-reply", "noreply", "donotreply", "notifications@",
+    "newsletter", "news@", "mailing", "bounce", "postmaster",
+    "linkedin.com", "facebookmail.com", "meetup.com", "eventbrite",
+    "microsoft.com", "teams.microsoft", "office365", "outlook.com_",
+    "stripe.com", "paypal.com", "github.com", "gitlab",
+    "googlealerts", "calendar-server", "notification",
+    "digest", "digests@", "automated", "mailer-daemon",
+]
+
+# Vocabulaire hors sujet à écarter d'emblée (mails perso, RH, arnaques loc.)
+MOTS_EXCLUS = [
+    "bail", "colocation", "appartement", "studio ", "loyer",
+    "fiche de salaire", "bulletin de salaire", "congé", " congés",
+    "payslip", "booking confirmation",
+]
+
+MOTS_DEVIS = [
+    # français
+    "devis", "proposition commerciale", " proposition",
+    "offre commerciale", "cotation", "facture pro forma",
+    "bon de commande", "estimation", "chiffrage", "budget pour",
+    # anglais
+    "quote", "quotation", "proposal", "estimate",
+    "statement of work", "sow", "pricing", "scope of work",
+    "pro forma invoice", "purchase order",
+]
+
+MOTS_CLOSING = ["sign", "accept", "validation", "bon pour accord",
+                "avance", "acompte", "signature", "devis n°", "devis no",
+                "quote #", "quote no"]
+
+
+# ===============================================================
+# 1. COLLECTE DES FICHIERS SELON LE FORMAT
+# ===============================================================
+
+def collecter_sources(chemin):
+    """
+    Retourne une liste de tuples (format, chemin) avec format = "mbox" ou "pst".
+    Gère : fichier .mbox / .pst / .zip Takeout, ou dossier à scanner.
+    """
+    sources = []
+
+    # --- Cas 1 : fichier .zip → on extrait les .mbox et .pst dedans
+    if chemin.lower().endswith(".zip") and os.path.isfile(chemin):
+        print("Zip détecté : extraction des boîtes dedans...")
+        dossier_tmp = tempfile.mkdtemp(prefix="takeout_")
+        with zipfile.ZipFile(chemin) as z:
+            for nom in z.namelist():
+                bas = nom.lower()
+                if bas.endswith(".mbox") or bas.endswith(".pst"):
+                    cible = os.path.join(dossier_tmp, os.path.basename(nom))
+                    with z.open(nom) as src, open(cible, "wb") as dst:
+                        dst.write(src.read())
+                    fmt = "mbox" if bas.endswith(".mbox") else "pst"
+                    sources.append((fmt, cible))
+                    print(f"  extrait : {os.path.basename(nom)} ({fmt})")
+        return sources
+
+    # --- Cas 2 : un seul fichier .mbox
+    if os.path.isfile(chemin) and chemin.lower().endswith(".mbox"):
+        return [("mbox", chemin)]
+
+    # --- Cas 3 : un seul fichier .pst
+    if os.path.isfile(chemin) and chemin.lower().endswith(".pst"):
+        return [("pst", chemin)]
+
+    # --- Cas 4 : un dossier → on cherche .mbox ET .pst dedans
+    if os.path.isdir(chemin):
+        for racine, _, noms in os.walk(chemin):
+            for n in noms:
+                bas = n.lower()
+                if bas.endswith(".mbox"):
+                    sources.append(("mbox", os.path.join(racine, n)))
+                elif bas.endswith(".pst"):
+                    sources.append(("pst", os.path.join(racine, n)))
+        return sources
+
+    print(f"!! Chemin introuvable : {chemin}")
+    print("   Fournis un fichier .mbox, .pst, .zip, ou un dossier.")
+    return []
+
+
+# ===============================================================
+# 2. LECTEUR MBOX (Gmail / Thunderbird)
+# ===============================================================
+
+def decoder(valeur):
+    if not valeur:
+        return ""
+    try:
+        return str(make_header(decode_header(valeur)))
+    except Exception:
+        return str(valeur)
+
+
+def iterer_mbox(chemin_mbox):
+    """Génère un dictionnaire standard par email du .mbox."""
+    boite = mailbox.mbox(chemin_mbox)
+    for message in boite:
+        From = message.get("From", "")
+        expediteur = ""
+        try:
+            _, mails = getaddresses([From])
+            expediteur = (mails[0][1] or "").lower()
+        except Exception:
+            expediteur = (From or "").lower()
+
+        corps = ""
+        try:
+            if message.is_multipart():
+                morceaux = []
+                for part in message.walk():
+                    if part.get_content_type() == "text/plain":
+                        charset = part.get_content_charset() or "utf-8"
+                        morceaux.append(part.get_payload(decode=True).decode(charset, errors="replace"))
+                corps = "\n".join(morceaux)
+            else:
+                charset = message.get_content_charset() or "utf-8"
+                corps = message.get_payload(decode=True).decode(charset, errors="replace")
+        except Exception:
+            corps = ""
+
+        jointe = False
+        try:
+            for part in message.walk():
+                if part.get_filename():
+                    jointe = True
+                    break
+        except Exception:
+            jointe = False
+
+        d = None
+        try:
+            d = parsedate_to_datetime(message.get("date")).replace(tzinfo=None)
+        except Exception:
+            d = None
+
+        yield {
+            "dossier": os.path.basename(chemin_mbox),
+            "date": d,
+            "expediteur": expediteur,
+            "destinataire": decoder(message.get("To", "")),
+            "objet": decoder(message.get("Subject", "")),
+            "corps": corps,
+            "jointe": jointe,
+        }
+
+
+# ===============================================================
+# 3. LECTEUR PST (Outlook) — nécessite pypff
+# ===============================================================
+
+def decode_corps(brut):
+    """Le corps PST peut être en bytes UTF-8, UTF-16 ou None → texte propre."""
+    if brut is None:
+        return ""
+    if isinstance(brut, str):
+        return brut
+    try:
+        if b"\x00" in brut[:200]:
+            return brut.decode("utf-16-le", errors="replace")
+        return brut.decode("utf-8", errors="replace")
+    except Exception:
+        try:
+            return brut.decode("cp1252", errors="replace")
+        except Exception:
+            return ""
+
+
+def chercher_entete(entetes, champ):
+    if not entetes:
+        return ""
+    match = re.search(r"^" + champ + r":\s*(.+)$", entetes,
+                     re.MULTILINE | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def iterer_pst(chemin_pst):
+    """Génère un dictionnaire standard par email du .pst."""
+    import pypff
+    pst = pypff.file()
+    pst.open(chemin_pst)
+    racine = pst.get_root_folder()
+    nom_fichier = os.path.basename(chemin_pst)
+
+    def walk(dossier, chemin_nom):
+        nom = dossier.name if dossier.name else ""
+        ici = (chemin_nom + "/" + nom).strip("/")
+        for i in range(dossier.number_of_sub_folders):
+            yield from walk(dossier.get_sub_folder(i), ici)
+        for i in range(dossier.number_of_sub_messages):
+            yield lire_message_pst(dossier.get_sub_message(i),
+                                   nom_fichier + "/" + ici)
+
+    yield from walk(racine, "")
+
+
+def lire_message_pst(message, dossier):
+    entetes = message.transport_headers or ""
+    expediteur = chercher_entete(entetes, "From")
+    destinataire = chercher_entete(entetes, "To")
+    if not expediteur:
+        expediteur = message.sender_name or ""
+
+    d = None
+    try:
+        d = message.client_submit_time
+        if d:
+            d = d.replace(tzinfo=None)
+    except Exception:
+        d = None
+    if d is None:
+        try:
+            d = parsedate_to_datetime(chercher_entete(entetes, "Date")).replace(tzinfo=None)
+        except Exception:
+            d = None
+
+    jointe = False
+    try:
+        jointe = message.number_of_attachments > 0
+    except Exception:
+        jointe = False
+
+    return {
+        "dossier": dossier,
+        "date": d,
+        "expediteur": expediteur,
+        "destinataire": destinataire,
+        "objet": message.subject or "",
+        "corps": decode_corps(message.plain_text_body),
+        "jointe": jointe,
+    }
+
+
+# ===============================================================
+# 4. DÉTECTION DES CANDIDATS DEVIS (commune aux deux formats)
+# ===============================================================
+
+def score_candidat(mail):
+    mail_bas = mail["expediteur"].lower()
+    sujet_bas = mail["objet"].lower()
+    corps_bas = mail["corps"].lower()
+    texte_bas = sujet_bas + " " + corps_bas
+
+    if any(motif in mail_bas for motif in EXPEDITEURS_EXCUS):
+        return False, 0
+    if any(mot in texte_bas for mot in MOTS_EXCLUS):
+        return False, 0
+
+    score = 0
+    for mot in MOTS_DEVIS:
+        mot_clean = mot.strip().lower()
+        if mot_clean in sujet_bas:
+            score += 3
+        elif mot_clean in corps_bas:
+            score += 1
+
+    if mail["jointe"]:
+        score += 2
+
+    for mot in MOTS_CLOSING:
+        if mot in texte_bas:
+            score += 1
+            break
+
+    return (score >= 3), score
+
+
+def extraire_adresses(texte):
+    if not texte:
+        return ""
+    return " ".join(re.findall(r"[\w.+-]+@[\w.-]+\.\w+", texte))
+
+
+# ===============================================================
+# 5. PROGRAMME PRINCIPAL
+# ===============================================================
+
+def main():
+    print("=" * 60)
+    print("  CHASSE AUX DEVIS FANTOMES — scan universel (mbox + pst)")
+    print("=" * 60)
+
+    chemin = CHEMIN
+    if not chemin:
+        print("\nGlisse-depose le .mbox / .pst / .zip / dossier dans la console,")
+        chemin = input("ou tape le chemin complet, puis Entrée : ").strip()
+    chemin = chemin.strip('"').strip("'")
+
+    # Détection du format + collecte
+    sources = collecter_sources(chemin)
+    if not sources:
+        return  # la console Spyder reste ouverte
+
+    nb_mbox = sum(1 for f, _ in sources if f == "mbox")
+    nb_pst = sum(1 for f, _ in sources if f == "pst")
+    print(f"\n{len(sources)} boite(s) trouvée(s) : {nb_mbox} mbox, {nb_pst} pst")
+    for fmt, p in sources:
+        print(f"  - [{fmt}] {os.path.basename(p)}")
+
+    # Vérification de pypff si des .pst sont présents
+    pypff_ok = True
+    if nb_pst > 0:
+        try:
+            import pypff  # noqa: F401
+        except ImportError:
+            pypff_ok = False
+            print("\n!! Librairie pypff manquante : les fichiers .pst seront IGNORÉS.")
+            print("   Pour les analyser, dans la console Spyder, tape :")
+            print("     !pip install libpff-python")
+            print("   puis relance (F5). Les .mbox, eux, fonctionnent déjà.")
+
+    if DEPUIS:
+        date_min = datetime.strptime(DEPUIS, "%Y-%m-%d")
+    else:
+        date_min = datetime.now() - timedelta(days=30 * FENETRE_MOIS)
+
+    total = 0
+    candidats = []
+    stats = {"robot": 0, "vieux": 0, "hors_sujet": 0, "sans_date": 0}
+
+    print(f"\nFenetre analysee : depuis le {date_min.strftime('%d/%m/%Y')}\n")
+
+    for fmt, chemin_source in sources:
+        if fmt == "pst" and not pypff_ok:
+            continue
+
+        print(f"Lecture [{fmt}] : {os.path.basename(chemin_source)} ...")
+        try:
+            if fmt == "mbox":
+                mails = iterer_mbox(chemin_source)
+            else:
+                mails = iterer_pst(chemin_source)
+        except Exception as e:
+            print("  !! Impossible de lire ce fichier :", e)
+            continue
+
+        nb = 0
+        for mail in mails:
+            nb += 1
+            total += 1
+            if mail["date"] and mail["date"] < date_min:
+                stats["vieux"] += 1
+                continue
+
+            ok, score = score_candidat(mail)
+            if not ok:
+                mail_bas = mail["expediteur"].lower()
+                if any(m in mail_bas for m in EXPEDITEURS_EXCUS):
+                    stats["robot"] += 1
+                elif not mail["date"]:
+                    stats["sans_date"] += 1
+                else:
+                    stats["hors_sujet"] += 1
+                continue
+
+            candidats.append({
+                "date": mail["date"].strftime("%Y-%m-%d") if mail["date"] else "",
+                "source": mail["dossier"][:80],
+                "expediteur": extraire_adresses(mail["expediteur"]) or mail["expediteur"][:150],
+                "destinataire": extraire_adresses(mail["destinataire"])[:200],
+                "objet": mail["objet"][:300],
+                "extrait": re.sub(r"\s+", " ", mail["corps"])[:500],
+                "piece_jointe": "oui" if mail["jointe"] else "non",
+                "score_brut": score,
+            })
+        print(f"  {nb} emails lus dans ce fichier")
+
+    # Tri et limite
+    candidats.sort(key=lambda c: (c["score_brut"], c["date"]), reverse=True)
+    candidats = candidats[:TOP]
+
+    # Écriture du CSV — dans le dossier de dépôt OneDrive
+    os.makedirs(DOSSIER_SORTIE, exist_ok=True)
+    sortie_csv = os.path.join(DOSSIER_SORTIE, FICHIER_CSV)
+    colonnes = ["date", "source", "expediteur", "destinataire",
+                "objet", "extrait", "piece_jointe", "score_brut"]
+    with open(sortie_csv, "w", newline="", encoding="utf-8-sig") as f:
+        ecrivain = csv.DictWriter(f, fieldnames=colonnes)
+        ecrivain.writeheader()
+        ecrivain.writerows(candidats)
+
+    # Rapport
+    print()
+    print("=" * 60)
+    print("  RAPPORT DU SCAN")
+    print("=" * 60)
+    print(f"Emails lus              : {total}")
+    print(f"  jetes (robots)        : {stats['robot']}")
+    print(f"  jetes (trop vieux)    : {stats['vieux']}")
+    print(f"  jetes (sans date)     : {stats['sans_date']}")
+    print(f"  jetes (hors sujet)    : {stats['hors_sujet']}")
+    print(f"CANDIDATS DEVIS         : {len(candidats)}")
+    print("=" * 60)
+    print(f"CSV cree -> {sortie_csv}")
+
+    if len(candidats) > 200:
+        nb_tranches = (len(candidats) + 199) // 200
+        print(f"\nPlus de 200 lignes : decoupe conseillee en {nb_tranches} tranches")
+        print("de 200 lignes avant de les donner a Claude/ChatGPT,")
+        print("avec le prompt d'extraction (ANNEXE A) sur chaque tranche.")
+
+    print("\nProchaine etape : tri humain (vert/orange/rouge), puis IA.")
+
+
+main()
